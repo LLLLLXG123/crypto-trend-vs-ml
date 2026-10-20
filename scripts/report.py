@@ -49,7 +49,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 def shown(name: str) -> str:
     """图上显示的名字，和 PPT 的叫法一致。"""
-    return name.replace("论文规则", "论文原版")
+    return name.replace("论文规则", "趋势追踪")
 
 
 def load_closes() -> pd.DataFrame:
@@ -335,7 +335,7 @@ def main():
     ax1.plot(closes.loc[start:end].index, closes.loc[start:end, "BTC/USDT"], color="#404040", linewidth=1.3)
     ax1.set_yscale("log")
     ax1.set_ylabel("BTC 价格（USDT）")
-    style_axes(ax1, "论文原版什么时候在场：BTC 价格与 BTC 仓位")
+    style_axes(ax1, "趋势追踪什么时候在场：BTC 价格与 BTC 仓位")
     ax2.fill_between(btc_weight.index, btc_weight.values * 100, color="#1f4e79", alpha=0.55, linewidth=0)
     ax2.set_ylabel("BTC 仓位占总资产（%）")
     ax2.set_ylim(0, 55)
@@ -532,9 +532,9 @@ def label_ends(fig, ax, ends, min_gap_pt=14):
 
 
 def plot_tuned(paper: pd.Series, tuned: dict, start: pd.Timestamp, end: pd.Timestamp, exposure: float):
-    """调参版 vs 论文原版：左边样本内（调参用的数据），右边样本外（从同一起点重新归一）。"""
+    """调参版 vs 趋势追踪：左边样本内（调参用的数据），右边样本外（从同一起点重新归一）。"""
     lines = {TUNED: tuned[TUNED], "论文规则（TrendEnsemble）": paper, TUNED_SAME: tuned[TUNED_SAME]}
-    labels = {TUNED: "调参版", "论文规则（TrendEnsemble）": "论文原版",
+    labels = {TUNED: "调参版", "论文规则（TrendEnsemble）": "趋势追踪",
               TUNED_SAME: f"同等仓位持有（{exposure:.0%}，和调参版一样）"}
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.2), dpi=150, gridspec_kw={"width_ratios": [3, 2]})
     spans = (("样本内：调参用的就是这段数据", start, PAPER_END - pd.Timedelta(days=1)),
