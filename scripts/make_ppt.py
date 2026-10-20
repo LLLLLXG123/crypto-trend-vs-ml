@@ -1,7 +1,7 @@
 """
-生成课堂展示用的 PPT：results/ 里的图表和指标 → results/展示.pptx（附讲稿）。
+生成课堂展示用的 PPT：results/ 里的图表和指标 → results/展示_v2.pptx（附讲稿）。
 
-用法（项目根目录，先跑 scripts/report.py）：
+用法（项目根目录，先跑 scripts/report.py 和 scripts/traits.py）：
     python -X utf8 scripts/make_ppt.py
 """
 
@@ -15,16 +15,20 @@ import pptkit as k
 
 ROOT = Path(__file__).resolve().parents[1]
 RES = ROOT / "results"
+TUNED_PARAMS = ROOT / "user_data" / "strategies" / "TrendTuned.json"
 SOURCE = ("数据：OKX 现货 BTC/USDT、ETH/USDT（2018-01 至 2026-10）｜ 回测：Freqtrade 2026.9 ｜ "
           "成本：每边 0.15%（手续费 0.1% + 滑点 0.05%）")
 
 TREND = "论文规则（TrendEnsemble）"
 ML = "机器学习（MLXGBoost）"
 ML_GROSS = "机器学习（不计成本）"
+TUNED = "调参版（TrendTuned）"
+TUNED_SAME = "同等仓位持有（调参版）"
 HOLD = "BTC/ETH 各半持有"
 BTC = "一直持有 BTC"
 SAME = "同等仓位持有"
-SHORT = {TREND: "论文规则", ML: "机器学习", HOLD: "各半持有", BTC: "持有 BTC"}
+SHORT = {TREND: "论文原版", ML: "机器学习", HOLD: "各半持有", BTC: "持有 BTC"}
+LOOKBACKS = (5, 10, 20, 30, 60, 90, 150, 250, 360)
 
 
 def pct(x, digits=1, sign=False):
@@ -39,28 +43,61 @@ def load():
     baseline = json.load(open(RES / "baseline.json", encoding="utf-8"))
     period = json.load(open(RES / "period.json", encoding="utf-8"))
     look = {}
-    for name in ("trend", "ml"):
+    for name in ("trend", "ml", "tuned"):
         path = RES / f"lookahead_{name}.csv"
         if path.exists():
             look[name] = pd.read_csv(path).iloc[0]
-    stats = pd.read_csv(RES / "trade_stats.csv").set_index("策略")
     costs = pd.read_csv(RES / "costs.csv").set_index("策略")
     recon = json.load(open(RES / "recon.json", encoding="utf-8"))
-    return metrics, fee, exposure, baseline, period, look, stats, costs, recon
+    traits = pd.read_csv(RES / "traits.csv", index_col=0)
+    traits_extra = json.load(open(RES / "traits.json", encoding="utf-8"))
+    tuned_params = json.load(open(TUNED_PARAMS, encoding="utf-8"))["params"]["buy"]
+    return metrics, fee, exposure, baseline, period, look, costs, recon, traits, traits_extra, tuned_params
+
+
+def tuned_lookbacks(params) -> list[int]:
+    """和 TrendTuned 的算法一致：整体缩放，再去掉最短的几个。"""
+    scaled = [max(2, round(lb * params["lb_scale"])) for lb in LOOKBACKS]
+    return scaled[params["drop_short"]:]
 
 
 def main():
-    metrics, fee, exposure, baseline, period, look, stats, costs, recon = load()
-    has_ml = (ML, "全区间") in metrics
+    (metrics, fee, exposure, baseline, period, look, costs, recon,
+     traits, traits_extra, tuned_params) = load()
     t_full, t_in, t_post = (metrics[(TREND, p)] for p in ("全区间", "论文样本期内", "论文发表后"))
-    h_full, h_post = metrics[(HOLD, "全区间")], metrics[(HOLD, "论文发表后")]
-    b_full, b_post = metrics[(BTC, "全区间")], metrics[(BTC, "论文发表后")]
+    u_full, u_in, u_post = (metrics[(TUNED, p)] for p in ("全区间", "论文样本期内", "论文发表后"))
+    us_in, us_post = metrics[(TUNED_SAME, "论文样本期内")], metrics[(TUNED_SAME, "论文发表后")]
+    h_full = metrics[(HOLD, "全区间")]
+    b_post = metrics[(BTC, "论文发表后")]
     s_full, s_in, s_post = (metrics[(SAME, p)] for p in ("全区间", "论文样本期内", "论文发表后"))
-    m_full, m_post, g_full = metrics[(ML, "全区间")], metrics[(ML, "论文发表后")], metrics[(ML_GROSS, "全区间")]
+    m_full, g_full = metrics[(ML, "全区间")], metrics[(ML_GROSS, "全区间")]
     c_t, c_m = costs.loc[TREND], costs.loc[ML]
-    avg_exp = baseline["trend_avg_exposure"]
+    avg_exp, tuned_exp = baseline["trend_avg_exposure"], baseline["tuned_avg_exposure"]
     start, end = period["eval_start"][:7], period["eval_end"][:7]
-    recon_text = f"最大差异 {recon['trend']:.2f}%（主策略）、{recon['ml']:.2f}%（机器学习）"
+    tb, te, csi, spx = (traits.loc[n] for n in ("BTC", "ETH", "沪深300", "标普500"))
+    mom = traits_extra["BTC动量30天"]
+    lbs = tuned_lookbacks(tuned_params)
+    in_edge = u_in["年化收益"] - us_in["年化收益"]
+    out_edge = u_post["年化收益"] - us_post["年化收益"]
+    u_dd = -u_post["最大回撤"]
+    over_cap = u_dd > 0.20
+    tuned_verdict = [
+        "和同等仓位持有比：",
+        f"样本内每年多赚 **{in_edge * 100:.0f} 个点**",
+        f"样本外只多 **{out_edge * 100:.1f} 个点**",
+        f"样本外最多亏 {pct(u_dd)}，" + ("超过了 20% 的上限" if over_cap else "没超过 20% 的上限"),
+    ]
+    tuned_notes = (
+        f"这页看调参版到底靠不靠谱。左边是调参用的那段数据：年化 {pct(u_in['年化收益'])}，最多只亏 {pct(-u_in['最大回撤'])}，"
+        f"曲线非常漂亮，每年比同样仓位一直拿着多赚 {in_edge * 100:.0f} 个点。右边是调参时没见过的 19 个月："
+        f"年化掉到 {pct(u_post['年化收益'])}，只比同样仓位的持有多 {out_edge * 100:.1f} 个点，"
+        f"最多亏了 {pct(u_dd)}" + ("，还超过了我们调参时定的 20% 上限。" if over_cap else "。") +
+        "说白了，500 组参数里挑出来的最好那组，多赚的部分大多是把历史行情背下来了。"
+        "这也是我们主线用论文原版参数、不用调过的参数的原因。")
+    tuned_conclusion = (f"4. 调参版：样本内年化 {pct(u_in['年化收益'])}，样本外只有 {pct(u_post['年化收益'])}，"
+                        "纸面漂亮靠不住")
+    tuned_conclusion_notes = (f"调参版在调参用的数据上年化 {pct(u_in['年化收益'])}，到了没见过的行情只剩 "
+                              f"{pct(u_post['年化收益'])}，纸面上漂亮的曲线靠不住。")
 
     prs = k.new_deck()
     page = 1
@@ -68,203 +105,282 @@ def main():
     # 1 封面
     s = k.blank(prs)
     k.text_box(s, k.MARGIN, Inches(2.0), Inches(12), Inches(1.0),
-               [("论文说的，发表后还灵吗？", {"bold": True})], size=40)
-    k.text_box(s, k.MARGIN, Inches(3.05), Inches(12), Inches(0.8),
-               "在 Freqtrade 中复现 2025 年的加密货币趋势策略，并与机器学习策略对比", size=22, color=k.MUTED)
+               [("论文复刻VS机器学习？", {"bold": True})], size=44)
+    k.text_box(s, k.MARGIN, Inches(3.1), Inches(12), Inches(0.8),
+               "在 Freqtrade 里回测 BTC、ETH 的现货策略", size=22, color=k.MUTED)
     bar = s.shapes.add_shape(k.MSO_SHAPE.RECTANGLE, k.MARGIN, Inches(4.0), Inches(1.2), Inches(0.07))
     bar.fill.solid()
     bar.fill.fore_color.rgb = k.ACCENT
     bar.line.fill.background()
     k.text_box(s, k.MARGIN, Inches(4.3), Inches(12), Inches(1.0),
-               [f"BTC/USDT、ETH/USDT 现货 ｜ OKX ｜ 回测区间 {start} 至 {end}",
+               [f"OKX 现货 BTC/USDT、ETH/USDT ｜ 回测区间 {start} 至 {end}",
                 ("2026 年 10 月 22 日", {"color": k.MUTED})], size=16)
-    k.notes(s, "大家好。今天讲的问题很简单：一篇 2025 年发表的加密货币策略论文，"
-               "我们把规则原样搬进开源交易软件 Freqtrade，在论文发表之后的真实行情里，它还灵不灵？"
-               "另外我们还做了一个机器学习版本作为对照。")
+    k.notes(s, "大家好。我们做了两个加密货币策略的回测。一个是把 2025 年一篇论文的规则原样搬过来，"
+               "另一个是用机器学习让模型自己找规律。另外我们还把论文的参数调了一版，"
+               "看看调出来的漂亮曲线到底靠不靠谱。所有回测都在开源软件 Freqtrade 里跑。")
 
-    # 2 研究问题与依据
+    # 2 数字货币的特点
     page += 1
     s = k.blank(prs)
-    k.title(s, "为什么选趋势跟踪：高波动资产上证据最多的策略", "研究依据")
+    k.title(s, "数字货币有什么特点，适合什么策略")
+    every = 1 / tb["单日涨跌超5%占比"]
+    every_csi = 1 / csi["单日涨跌超5%占比"]
+    k.table(s, k.MARGIN, Inches(1.6), Inches(12.1), [
+        ["特点", "数据（2019-05 至 2026-10）", "所以策略要"],
+        ["波动大", f"年化波动 BTC {pct(tb['年化波动'], 0)}、ETH {pct(te['年化波动'], 0)}；"
+                  f"沪深 300 {pct(csi['年化波动'], 0)}、标普 500 {pct(spx['年化波动'], 0)}",
+         "按波动率定仓位，波动越大买得越少"],
+        ["跌起来很深", f"BTC 最多跌掉 {pct(-tb['最大回撤'], 0)}，单日最多跌 {pct(-tb['单日最大跌幅'], 0)}",
+         "一定要有卖出规则，不能一直拿着硬扛"],
+        ["大涨大跌是常态", f"BTC 平均 {every:.0f} 天就有 1 天涨跌超 5%；沪深 300 要 {round(every_csi, -2):.0f} 天",
+         "别做太短的周期，日线就够了"],
+        ["有趋势", f"BTC 上月涨，下月平均涨 {pct(mom['上段涨后下段平均'])}；"
+                  f"上月跌，下月平均只涨 {pct(mom['上段跌后下段平均'])}",
+         "顺着趋势做：创新高就买，跌破就卖"],
+        ["没有现金流", "没有利润，也没有分红，算不出估值", "基本面、估值类的方法用不上，主要看价格"],
+        ["全年不停", "一年 365 天、一天 24 小时都在交易，没有涨跌停", "交给程序自动执行"],
+    ], col_widths=[1.7, 6.2, 4.2], size=14, row_height=0.62, left_cols=(0, 1, 2))
+    k.callout(s, k.MARGIN, Inches(6.05), Inches(12.1), Inches(0.75),
+              "所以我们选：趋势跟踪 + 按波动率定仓位，只做多现货，日线低频")
+    k.footer(s, page, "BTC、ETH：OKX 日线；沪深 300、标普 500：新浪财经（akshare）｜ "
+                      "“有趋势”一行是不重叠的 30 天区间，共 89 段，只作直观参考")
+    k.notes(s, f"先说说数字货币和股票有什么不一样。第一是波动大，比特币一年的波动率有 {pct(tb['年化波动'], 0)}，"
+               f"差不多是沪深 300 的 {tb['年化波动'] / csi['年化波动']:.1f} 倍。第二是跌起来很深，"
+               f"比特币最多跌掉过 {pct(-tb['最大回撤'], 0)}。第三是大涨大跌很常见，"
+               f"比特币大约每 {every:.0f} 天就有一天涨跌超过 5%。第四是它有趋势，涨起来容易接着涨，"
+               "这个结论主要来自文献，表里这个数只是个直观的例子，样本不多。"
+               "第五，它没有利润和分红，没法算估值，所以只能看价格本身。最后它全年不停地交易，适合交给程序。"
+               "这几条合起来，就是我们选趋势跟踪、按波动率定仓位的原因。")
+
+    # 3 文献
+    page += 1
+    s = k.blank(prs)
+    k.title(s, "文献里的证据")
     k.text_box(s, k.MARGIN, Inches(1.65), Inches(12.1), Inches(4.2), [
-        "**期货（含商品）**：过去 12 个月涨跌能预测未来，百年样本都成立 —— Moskowitz, Ooi & Pedersen (2012)；Hurst, Ooi & Pedersen (2017)",
-        "**加密货币**：时间序列动量很强 —— Liu & Tsyvinski (2021, RFS)；均线规则明显降低比特币回撤 —— Detzel 等 (2021)",
-        "**最新**：多周期通道突破 + 按波动率定仓位，扣费后夏普 > 1.5 —— Zarattini, Pagani & Barbon (2025)",
-        "**反面**：抄底类规则在 2022 年后失效 —— Quantpedia (2024)；大批技术指标在比特币样本外失灵 —— Hudson & Urquhart (2021)",
-        "**提醒**：策略发表后收益平均下降一半以上 —— McLean & Pontiff (2016, JF)",
+        "**商品期货**：过去一年涨的，接下来还容易涨，一百多年的数据都是这样（Moskowitz 等 2012；Hurst 等 2017）",
+        "**加密货币**：动量效应很强（Liu & Tsyvinski 2021，RFS）；用均线能明显减少比特币的回撤（Detzel 等 2021）",
+        "**我们复现的论文**：多个周期的通道突破，再按波动率定仓位，扣完手续费夏普还在 1.5 以上（Zarattini、Pagani & Barbon 2025）",
+        "**反例**：抄底类的规则 2022 年以后就不灵了（Quantpedia 2024）；很多技术指标换一段数据就失效（Hudson & Urquhart 2021）",
+        "**要小心**：策略发表以后，收益平均会少一半以上（McLean & Pontiff 2016，JF）",
     ], size=17, spacing=12)
     k.callout(s, k.MARGIN, Inches(5.75), Inches(12.1), Inches(0.9),
-              "我们的问题：2025 年论文的规则一个参数都不改，论文样本截止（2025-03）之后的 19 个月还有效吗？")
+              "我们想知道：这篇论文的参数一个不改，在它发表后的 19 个月里还灵不灵？")
     k.footer(s, page, "文献详见项目 docs/2026-10-20-策略文献调研.md")
-    k.notes(s, "选趋势跟踪是因为它在高波动资产上证据最多：商品期货上有百年证据，"
-               "加密货币上 2021 年 RFS 的论文也证实了很强的动量。我们复现的是 2025 年 Zarattini 等人的论文。"
-               "同时要提醒：McLean 和 Pontiff 发现策略发表后收益平均会下降一半以上，所以发表后的检验才是关键。")
+    k.notes(s, "趋势跟踪在高波动的资产上证据最多。商品期货有一百多年的数据，加密货币上 2021 年 RFS 的论文也证实了动量很强。"
+               "我们复现的是 2025 年 Zarattini 等人的论文。不过也有反例，抄底类的规则近几年就不灵了。"
+               "还有一点要注意：McLean 和 Pontiff 发现，策略一发表，收益平均会少一半以上。"
+               "所以我们最关心的，是这篇论文发表之后它还灵不灵。")
 
-    # 3 主策略规则
+    # 4 策略一：论文复现
     page += 1
     s = k.blank(prs)
-    k.title(s, "主策略 TrendEnsemble：照抄论文规则，一个参数都没调", "策略一")
-    w, gap, top, h = Inches(3.85), Inches(0.28), Inches(1.75), Inches(3.6)
+    k.title(s, "策略一：论文复现（TrendEnsemble）")
+    w, gap, top, h = Inches(3.85), Inches(0.28), Inches(1.65), Inches(3.6)
     k.panel(s, k.MARGIN, top, w, h, "什么时候买",
-            ["回看期共 9 个，从 5 天到 360 天",
-             "收盘价创出该回看期的新高 → 这一份开仓",
-             "9 份各自独立进出"])
+            ["一共 9 个回看期，从 5 天到 360 天",
+             "收盘价创出这段时间的新高，就买入一份",
+             "9 份各管各的"])
     k.panel(s, k.MARGIN + w + gap, top, w, h, "什么时候卖",
-            ["止损线 = 回看期内最高与最低收盘价的中点",
-             "止损线只升不降（移动止损）",
-             "收盘价跌破止损线 → 这一份平仓"])
+            ["止损线是这段时间最高价和最低价的中间",
+             "止损线只往上挪，不往下挪",
+             "收盘跌破止损线，就卖掉这一份"])
     k.panel(s, k.MARGIN + 2 * (w + gap), top, w, h, "买多少",
-            ["每份权重 = min(25% ÷ 近 90 天年化波动率, 2)",
-             "9 份取平均；现货不加杠杆，封顶 100%",
-             "BTC、ETH 各占一半资金"])
-    k.text_box(s, k.MARGIN, Inches(5.65), Inches(12.1), Inches(1.0), [
-        "日线运行：每天 UTC 0 点收盘后算信号，下一根开盘成交；每天把仓位调到目标，偏差小于 5% 不动（降低换手）",
-        ("参数全部来自论文，没有在我们的数据上优化过 —— 所以不存在“调参凑曲线”", {"color": k.ACCENT, "bold": True}),
+            ["每份仓位 = 25% ÷ 最近 90 天的年化波动率，最多 2 倍",
+             "9 份取平均，现货不加杠杆，最多 100%",
+             "BTC、ETH 各分一半钱"])
+    k.text_box(s, k.MARGIN, Inches(5.55), Inches(12.1), Inches(1.2), [
+        "每天收盘后算信号，第二天开盘成交；每天把仓位调到目标，差不到 5% 就不动，省手续费",
+        ("参数全部照抄论文，没有在我们的数据上调过", {"color": k.ACCENT, "bold": True}),
     ], size=15, spacing=8)
     k.footer(s, page, SOURCE)
-    k.notes(s, "规则分三块。买：9 个不同长度的回看期，收盘价创新高就开一份。卖：止损线是区间高低点的中点，"
-               "只升不降，跌破就平。买多少：按波动率定仓位，波动越大仓位越小。"
-               "所有参数都是论文里的，我们一个都没改，这样就不存在拿数据调参数的问题。")
+    k.notes(s, "规则分三块。什么时候买：有 9 个长短不同的回看期，收盘价创出这段时间的新高，就买一份。"
+               "什么时候卖：止损线放在这段时间最高价和最低价的中间，只往上挪，跌破就卖。"
+               "买多少：波动越大买得越少。参数全是论文里的，我们一个都没改。")
 
-    # 4 机器学习备份
+    # 5 策略二：机器学习
     page += 1
     s = k.blank(prs)
-    k.title(s, "备份策略 MLXGBoost：让机器学习自己找规律", "策略二")
+    k.title(s, "策略二：机器学习（MLXGBoost）")
     k.text_box(s, k.MARGIN, Inches(1.65), Inches(7.3), Inches(4.9), [
-        "**模型**：Freqtrade 自带的 FreqAI + XGBoost，参照 Bysik & Ślepaczuk (2026)",
-        "**预测什么**：未来 24 小时的平均涨幅（1 小时 K 线）",
-        "**看什么**：58 个简单特征 —— 多周期涨跌幅、波动率、离区间高低点的距离、量比、几点钟、星期几，以及另一个币的同类特征",
-        "**怎么训练**：每周用过去 365 天重新训练一次 → 每次预测的都是模型没见过的未来",
-        "**什么时候买**：预测涨幅 > 2 × 一买一卖总成本（0.6%）才买；预测转负就卖；模型没见过的行情不交易",
-        "**买多少**：min(25% ÷ 年化波动率, 1) × 该币一半资金",
+        "**模型**：Freqtrade 自带的 FreqAI + XGBoost，做法参照 Bysik & Ślepaczuk (2026)",
+        "**预测什么**：未来 24 小时的平均涨幅，用 1 小时 K 线",
+        "**看什么**：58 个简单特征，比如不同周期的涨跌幅、波动率、离最近高点低点有多远、成交量、几点钟、星期几，还有另一个币的同类特征",
+        "**怎么训练**：每周用过去 365 天的数据重新训练一次，所以每次预测的都是模型没见过的行情",
+        "**什么时候买**：预测涨幅超过一买一卖总成本的 2 倍（0.6%）才买；预测转负就卖",
+        "**买多少**：25% ÷ 年化波动率，最多用到这个币的一半资金",
     ], size=16, spacing=11)
     k.panel(s, Inches(8.25), Inches(1.75), Inches(4.45), Inches(3.3), "为什么这样设计",
-            ["Jaquart 等 (2021)：预测太短期，手续费会吃光收益",
-             "Cakici 等 (2024)：复杂模型提升有限，简单特征才有用",
-             "门槛和训练窗口事先定死，不看结果调"], size=15)
+            ["Jaquart 等 (2021)：预测周期太短，手续费会把收益吃光",
+             "Cakici 等 (2024)：模型再复杂，提升也不大",
+             "门槛和训练窗口事先定好，不看结果再改"], size=15)
     k.footer(s, page, SOURCE)
-    k.notes(s, "备份策略换一个思路：不写死规则，让 XGBoost 从 58 个简单特征里自己学，预测未来 24 小时的涨幅。"
-               "关键是滚动训练：每周只用过去一年的数据重训，所以每一次预测都是对没见过的未来做的。"
-               "另外只有预测涨幅超过两倍成本才交易，避免被手续费吃掉。")
+    k.notes(s, "第二个策略换个思路：不写死规则，让 XGBoost 从 58 个简单特征里自己学，预测未来 24 小时会涨多少。"
+               "它每周只用过去一年的数据重新训练，所以每一次预测都是对没见过的行情做的。"
+               "另外只有预测涨幅超过两倍成本才买，免得被手续费吃掉。")
 
-    # 5 四件事
+    # 6 策略三：调参版
     page += 1
     s = k.blank(prs)
-    k.title(s, "让结果可信的四件事", "检验方法")
+    k.title(s, "策略三：调参版（TrendTuned）")
+    k.table(s, k.MARGIN, Inches(1.65), Inches(7.6), [
+        ["参数", "论文", "调参后", "试过的范围"],
+        ["目标波动率", "25%", pct(tuned_params["vol_target"], 0), "10% 到 100%"],
+        ["算波动率用几天", "90 天", f"{tuned_params['vol_window']} 天", "30 到 180 天"],
+        ["回看期", "5–360 天，9 个", f"{lbs[0]}–{lbs[-1]} 天，{len(lbs)} 个", "长度 ×0.5 到 ×1.25，最短的可去掉 0–4 个"],
+        ["止损线位置", "中间（50%）", f"{tuned_params['stop_frac']:.0%}", "30% 到 70%"],
+    ], col_widths=[1.8, 2.0, 2.0, 2.8], size=14, row_height=0.62)
+    k.text_box(s, k.MARGIN, Inches(4.95), Inches(7.6), Inches(1.2), [
+        ("规则一点没变，只改了论文里的几个数字", {"color": k.ACCENT, "bold": True}),
+        "调出来的结果：回看期更短，止损更早，仓位更重",
+    ], size=16, spacing=8)
+    k.panel(s, Inches(8.55), Inches(1.65), Inches(4.2), Inches(3.75), "怎么调的",
+            ["用 Freqtrade 自带的 hyperopt，试了 500 组参数",
+             "只用 2019-05 到 2025-03 的数据，也就是论文的样本期",
+             "目标：最大回撤不超过 20%，年化收益越高越好",
+             "2025-03 以后的数据调参时一点没碰，留着检验"], size=15)
+    k.footer(s, page, SOURCE)
+    k.notes(s, "第三个策略是我们自己加的。规则和论文完全一样，只是把论文里的几个数字交给 Freqtrade 的 hyperopt 去调，"
+               f"一共试了 500 组。调出来的结果是：回看期整体缩短一半、去掉最短的两个，止损线提高到 {tuned_params['stop_frac']:.0%} 的位置，"
+               f"也就是更早卖；目标波动率从 25% 提到 {pct(tuned_params['vol_target'], 0)}，也就是仓位更重。我们给它定的目标是：最大回撤不超过 20%，在这个前提下年化收益越高越好。"
+               "关键是我们只拿论文样本期的数据去调，2025 年 3 月以后的行情调参时完全没碰，"
+               "这样才能看出调出来的参数是真有用，还是只是把历史背下来了。")
+
+    # 7 检验方法
+    page += 1
+    s = k.blank(prs)
+    k.title(s, "怎么保证结果可信")
     fee_hi = fee.iloc[-1]
-    look_t, look_m = look["trend"], look["ml"]
-    signals_ok = all(r["biased_entry_signals"] == 0 and r["biased_exit_signals"] == 0 for r in (look_t, look_m))
-    look_text = (f"两个策略各抽查 {int(look_t['total_signals'])} 笔交易，买卖点全部一致" if signals_ok
-                 else "发现偏差，见第 11 页")
-    k.table(s, k.MARGIN, Inches(1.7), Inches(12.1), [
+    checked = [look[n] for n in ("trend", "ml", "tuned") if n in look]
+    signals_ok = all(r["biased_entry_signals"] == 0 and r["biased_exit_signals"] == 0 for r in checked)
+    look_text = (f"{len(checked)} 个策略各抽查 {int(checked[0]['total_signals'])} 笔交易，买卖点全部一致" if signals_ok
+                 else "发现偏差，见稳健性那页")
+    k.table(s, k.MARGIN, Inches(1.6), Inches(12.1), [
         ["检验", "怎么做", "结果"],
-        ["1 手续费", "每边 0.15%；另测 0、0.25%、0.5%",
-         f"主策略：成本提高到 3 倍多，年化仍有 {pct(fee_hi['年化收益'])}；机器学习：扣费后由盈转亏"],
-        ["2 不偷看未来", "Freqtrade 的 lookahead-analysis：截掉后面的数据重跑，逐笔比对", look_text],
-        ["3 和一直持有比", "BTC、ETH、各半持有，外加“同等仓位持有”",
-         f"同等风险下，主策略年化 {pct(t_full['年化收益'])} vs {pct(s_full['年化收益'])}"],
-        ["4 样本内外分开", "以论文样本截止日 2025-03-15 为界；机器学习每周滚动重训，全程样本外",
-         f"发表后：主策略年化 {pct(t_post['年化收益'])}，与同等仓位持有 {pct(s_post['年化收益'])} 打平"],
-    ], col_widths=[2.0, 5.0, 5.1], size=14, row_height=0.78)
+        ["1 算手续费", "每边 0.15%；另外测了 0、0.25%、0.5%",
+         f"论文原版：成本翻 3 倍多，年化还有 {pct(fee_hi['年化收益'])}；机器学习：扣完手续费由赚变亏"],
+        ["2 不偷看未来", "用 Freqtrade 的 lookahead-analysis：把后面的数据截掉重跑，逐笔比对", look_text],
+        ["3 和一直持有比", "持有 BTC、ETH、各一半，外加“同等仓位持有”",
+         f"仓位一样的情况下，论文原版年化 {pct(t_full['年化收益'])}，持有 {pct(s_full['年化收益'])}"],
+        ["4 调参和检验分开", "以论文样本截止日 2025-03-15 为界；调参版只用之前的数据调；机器学习每周滚动训练",
+         "2025-03 以后的结果，三个策略都没见过"],
+    ], col_widths=[2.0, 5.0, 5.1], size=14, row_height=0.8, left_cols=(0, 1, 2))
+    recon_text = "、".join(f"{label} {recon[key]:.2f}%" for key, label in
+                          (("trend", "论文原版"), ("ml", "机器学习"), ("tuned", "调参版")) if key in recon)
     k.text_box(s, k.MARGIN, Inches(5.95), Inches(12.1), Inches(0.8), [
-        f"另外：用逐笔订单独立重算净值，与 Freqtrade 自己的账户记录逐日对比，{recon_text}",
+        f"另外：自己用逐笔订单重算净值，和 Freqtrade 账户记录逐日对比，最大差异 {recon_text}",
     ], size=14, color=k.MUTED)
     k.footer(s, page, SOURCE)
-    k.notes(s, "为了让结果可信，我们做了四件事。手续费：按每边 0.15% 算，还测了不收费和更贵的情况。"
-               "偷看未来：用 Freqtrade 自带的工具，把后面的数据截掉重跑，逐笔比对买卖点，两个策略都一致。"
-               "对比：不只比一直持有，还比了一个同等仓位的持有组合，这样风险是对齐的。"
-               "样本内外：主策略以论文样本截止日为界分开看；机器学习每周只用过去的数据重训，本身就全程是样本外。")
+    k.notes(s, "为了让结果可信，我们做了四件事。第一，手续费按每边 0.15% 算，还试了不收费和更贵的情况。"
+               "第二，用 Freqtrade 自带的工具查有没有偷看未来：把后面的数据截掉重跑，逐笔比对买卖点。"
+               "第三，不只和一直持有比，还和一个仓位一样大的持有组合比，这样风险是对齐的。"
+               "第四，调参和检验用不同的时间段，2025 年 3 月以后的行情三个策略都没见过。")
 
-    # 6 收益曲线
+    # 8 全区间收益
     page += 1
     s = k.blank(prs)
-    k.title(s, "全区间：收益只有持有的零头，但回撤小得多", "结果一")
-    k.image(s, RES / "equity_curves.png", k.MARGIN, Inches(1.55), width=Inches(9.0))
-    k.text_box(s, k.MARGIN, Inches(5.9), Inches(9.0), Inches(0.8),
-               [(f"公平的比较：蓝色虚线同样只放 {pct(avg_exp, 0)} 在币上，论文规则每年比它多赚约 "
-                 f"{(t_full['年化收益'] - s_full['年化收益']) * 100:.0f} 个百分点", {"bold": True, "color": k.ACCENT})], size=16)
+    k.title(s, "全区间收益")
+    k.image(s, RES / "equity_curves.png", k.MARGIN, Inches(1.5), width=Inches(9.0))
+    k.text_box(s, k.MARGIN, Inches(5.85), Inches(9.0), Inches(0.8),
+               [(f"蓝色虚线和论文原版仓位一样（{pct(avg_exp, 0)}），论文原版每年比它多赚约 "
+                 f"{(t_full['年化收益'] - s_full['年化收益']) * 100:.0f} 个点", {"bold": True, "color": k.ACCENT})], size=16)
     k.panel(s, Inches(9.85), Inches(1.6), Inches(2.9), Inches(4.25), "数字",
-            [f"论文规则：年化 **{pct(t_full['年化收益'])}**，最大回撤 **{pct(t_full['最大回撤'])}**",
-             f"各半持有：年化 {pct(h_full['年化收益'])}，最大回撤 {pct(h_full['最大回撤'])}",
-             f"论文规则平均只用了 **{pct(avg_exp, 0)}** 的资金",
-             f"同样只放 {pct(avg_exp, 0)} 在币上：年化 {pct(s_full['年化收益'])}",
-             ("橙线：机器学习，见第 10 页", {"color": k.MUTED})], size=15)
+            [f"论文原版：年化 **{pct(t_full['年化收益'])}**，最多亏 **{pct(-t_full['最大回撤'])}**",
+             f"各半持有：年化 {pct(h_full['年化收益'])}，最多亏 {pct(-h_full['最大回撤'])}",
+             f"论文原版平均只用了 **{pct(avg_exp, 0)}** 的钱",
+             f"只放 {pct(avg_exp, 0)} 在币上一直拿着：年化 {pct(s_full['年化收益'])}",
+             ("橙线是机器学习，后面单独讲", {"color": k.MUTED})], size=15)
     k.footer(s, page, SOURCE)
-    k.notes(s, f"先看全区间。一直持有的收益远高于论文规则，这是事实，但它中间最多亏了 {pct(-h_full['最大回撤'], 0)}。"
-               f"论文规则平均只用了 {pct(avg_exp, 0)} 的资金，所以公平的比较对象是同样只放 {pct(avg_exp, 0)} 在币上的组合，"
-               f"它的年化是 {pct(s_full['年化收益'])}，论文规则是 {pct(t_full['年化收益'])}。"
-               "最下面的橙线是机器学习，扣费后是亏的，后面单独讲。")
+    k.notes(s, f"先看全区间。一直持有赚得最多，这没什么好说的，但它中间最多亏过 {pct(-h_full['最大回撤'], 0)}，"
+               "一般人很难拿得住。论文原版平均只用了 "
+               f"{pct(avg_exp, 0)} 的钱，所以拿它和满仓持有比不公平。我们加了一条虚线，同样只放 {pct(avg_exp, 0)} 在币上一直拿着，"
+               f"它的年化是 {pct(s_full['年化收益'])}，论文原版是 {pct(t_full['年化收益'])}。最下面的橙线是机器学习，扣完手续费是亏的，后面单独说。")
 
-    # 7 收益和风险一起看
+    # 9 收益和风险
     page += 1
     s = k.blank(prs)
-    k.title(s, "收益和风险放在一起看：同样的风险，论文规则赚得更多", "结果二")
+    k.title(s, "收益和风险")
     k.image(s, RES / "risk_return.png", k.MARGIN, Inches(1.5), height=Inches(5.3))
     rows = [["", "年化收益", "年化波动", "夏普", "最大回撤"]]
-    names = [TREND] + ([ML] if has_ml else []) + [SAME, HOLD, BTC]
-    for n in names:
+    for n in (TREND, ML, SAME, HOLD, BTC):
         r = metrics[(n, "全区间")]
         label = f"同等仓位（{pct(avg_exp, 0)}）" if n == SAME else SHORT.get(n, n)
         rows.append([label, pct(r["年化收益"]), pct(r["年化波动"]), f"{r['夏普']:.2f}", pct(r["最大回撤"])])
     k.table(s, Inches(8.0), Inches(1.75), Inches(4.75), rows, col_widths=[2.3, 1.3, 1.3, 1.0, 1.3],
             size=12, row_height=0.6)
     k.footer(s, page, SOURCE)
-    k.notes(s, "这张图横轴是最大回撤，越往左越安全；纵轴是年化收益。一直持有在右上角，收益高但风险极大。"
-               "论文规则在左边。和同等仓位的持有组合比，论文规则在同样风险下收益更高，夏普也更高。"
-               "机器学习在零线以下，扣费后是亏的。")
+    k.notes(s, "这张图横轴是最大回撤，越往左越安全；纵轴是年化收益。一直持有在右上角，赚得多，但风险也大得多。"
+               "论文原版在左边。和仓位一样大的持有组合比，它在差不多的风险下赚得更多，夏普也更高。"
+               "机器学习在零线下面，扣完手续费是亏的。")
 
-    # 8 论文发表后
+    # 10 论文发表后的表现
     page += 1
     s = k.blank(prs)
-    k.title(s, "论文发表之后：风险控制还在，超额收益没了", "结果三：真正的样本外")
-    k.image(s, RES / "post_paper.png", k.MARGIN, Inches(1.55), width=Inches(9.0))
-    k.text_box(s, k.MARGIN, Inches(5.65), Inches(9.0), Inches(0.9),
-               [("持有的人坐了一趟过山车；论文规则几乎是一条直线，但和同等仓位持有（浅蓝）基本重合",
+    k.title(s, "论文发表后的表现")
+    k.image(s, RES / "post_paper.png", k.MARGIN, Inches(1.5), width=Inches(9.0))
+    k.text_box(s, k.MARGIN, Inches(5.6), Inches(9.0), Inches(0.9),
+               [("一直持有像坐过山车；论文原版几乎是一条平线，但和同等仓位持有（浅蓝）差不多重合",
                  {"bold": True, "color": k.ACCENT})], size=16)
     k.text_box(s, Inches(9.75), Inches(1.6), Inches(3.0), Inches(0.5),
-               [("2025-03 之后", {"bold": True, "color": k.ACCENT})], size=18)
+               [("2025-03 以后", {"bold": True, "color": k.ACCENT})], size=18)
     rows = [["", "总收益", "最大回撤"]]
-    for n, label in ((TREND, "论文规则"), (SAME, "同等仓位"), (BTC, "持有 BTC"), (ML, "机器学习")):
+    for n, label in ((TREND, "论文原版"), (SAME, "同等仓位"), (BTC, "持有 BTC"), (ML, "机器学习")):
         r = metrics[(n, "论文发表后")]
         rows.append([label, pct(r["总收益"], sign=True), pct(r["最大回撤"])])
     k.table(s, Inches(9.75), Inches(2.2), Inches(3.0), rows, col_widths=[1.2, 0.9, 0.9], size=13,
             row_height=0.5)
     k.text_box(s, Inches(9.75), Inches(4.85), Inches(3.0), Inches(1.2),
-               ["论文规则与同等仓位打平", "超额收益消失", "印证文献中的“发表后衰减”"], size=14, spacing=2)
+               ["回撤还是小", "但没比同等仓位持有多赚", "符合“发表后收益缩水”"], size=14, spacing=2)
     k.footer(s, page, SOURCE)
-    k.notes(s, f"这是最关键的一页。论文样本截止后的 19 个月，BTC 先涨后跌，持有的人最多亏了 {pct(-b_post['最大回撤'], 0)}。"
-               f"论文规则赚了 {pct(t_post['总收益'])}，最大回撤只有 {pct(-t_post['最大回撤'], 0)}。"
-               "但和同等仓位持有比，收益基本打平：风险控制依然有效，超额收益没了。"
-               "这正好印证了 McLean 和 Pontiff 的发现。19 个月样本还短，结论要谨慎。")
+    k.notes(s, "这页是我们最想让大家看的。论文写完的时候，后面这段行情它是没见过的，算是一场真正的考试。"
+               f"这 19 个月比特币先涨后跌，一直拿着最多亏过 {pct(-b_post['最大回撤'], 0)}。"
+               f"论文原版赚了 {pct(t_post['总收益'])}，最多只亏了 {pct(-t_post['最大回撤'], 0)}，稳是真的稳；"
+               "但和同等仓位的持有组合比，基本打平，没有多赚。这跟 McLean 和 Pontiff 说的一样，"
+               "策略一公开，多赚的那部分往往就缩水了。当然 19 个月还不算长，我们也不敢把话说死。")
 
-    # 9 熊市
+    # 11 调参版：样本内 vs 样本外
     page += 1
     s = k.blank(prs)
-    k.title(s, "2022 年熊市：价格跌了 77%，论文规则基本在场外", "结果四：为什么回撤小")
-    k.image(s, RES / "trend_exposure.png", k.MARGIN, Inches(1.55), width=Inches(9.0))
+    k.title(s, "调参版：样本内 vs 样本外")
+    k.image(s, RES / "tuned.png", k.MARGIN, Inches(1.5), width=Inches(9.0))
+    rows = [["", "样本内", "样本外"],
+            ["调参版 年化", pct(u_in["年化收益"]), pct(u_post["年化收益"])],
+            ["调参版 最大回撤", pct(u_in["最大回撤"]), pct(u_post["最大回撤"])],
+            ["论文原版 年化", pct(t_in["年化收益"]), pct(t_post["年化收益"])],
+            ["同等仓位 年化", pct(us_in["年化收益"]), pct(us_post["年化收益"])]]
+    k.table(s, Inches(9.75), Inches(1.6), Inches(3.0), rows, col_widths=[1.6, 0.9, 0.9], size=12,
+            row_height=0.55)
+    k.text_box(s, Inches(9.75), Inches(4.5), Inches(3.0), Inches(1.8), tuned_verdict, size=14, spacing=4)
+    k.footer(s, page, SOURCE)
+    k.notes(s, tuned_notes)
+
+    # 12 2022 年熊市
+    page += 1
+    s = k.blank(prs)
+    k.title(s, "2022 年熊市里的仓位")
+    k.image(s, RES / "trend_exposure.png", k.MARGIN, Inches(1.5), width=Inches(9.0))
     k.panel(s, Inches(9.85), Inches(1.6), Inches(2.9), Inches(4.25), "看点",
-            ["上涨趋势里逐步加仓，跌破止损就撤",
-             "2022 年几乎全程空仓或小仓位",
+            ["涨的时候一点点加仓，跌破止损就撤",
+             "2022 年几乎一直空仓或者轻仓",
              f"平均仓位 {pct(avg_exp, 0)}，最高 {pct(exposure.loc[TREND, '最高仓位'], 0)}",
-             "代价：牛市里也只拿到一部分涨幅"], size=16)
+             "代价是牛市里也只吃到一部分涨幅"], size=15)
     k.footer(s, page, SOURCE)
-    k.notes(s, "回撤小的原因在这张图：下面是论文规则在 BTC 上的仓位。上涨趋势里仓位逐步加上去，"
-               "趋势一破就撤。2022 年熊市几乎全程在场外。代价是牛市里也只拿到一部分涨幅。")
+    k.notes(s, "回撤为什么小，看这张图就明白了。下面是论文原版在 BTC 上的仓位。涨的时候仓位一点点加上去，"
+               "趋势一破就撤。2022 年比特币跌了七成多，它几乎一直在场外。代价是牛市里也只吃到一部分涨幅。")
 
-    # 10 机器学习
+    # 13 机器学习：手续费的影响
     page += 1
     s = k.blank(prs)
-    k.title(s, f"机器学习：扣费前赚 {pct(g_full['总收益'], 0)}，扣费后亏 {pct(-m_full['总收益'], 0)}",
-            "结果五：策略二")
-    k.image(s, RES / "ml_costs.png", k.MARGIN, Inches(1.55), width=Inches(8.2))
-    k.text_box(s, k.MARGIN, Inches(5.2), Inches(8.2), Inches(1.6), [
-        (f"同样的买卖信号，只差成本：一年交易 {c_m['每年交易笔数']:.0f} 笔，平均只拿 {c_m['平均持仓天数']:.1f} 天",
+    k.title(s, "机器学习：手续费的影响")
+    k.image(s, RES / "ml_costs.png", k.MARGIN, Inches(1.5), width=Inches(8.2))
+    k.text_box(s, k.MARGIN, Inches(5.15), Inches(8.2), Inches(1.7), [
+        (f"同样的买卖信号，不算手续费赚 {pct(g_full['总收益'], 0)}，算上手续费亏 {pct(-m_full['总收益'], 0)}",
          {"bold": True, "color": k.ACCENT, "size": 16}),
-        f"7.5 年手续费合计 {c_m['手续费合计']:,.0f} USDT，相当于本金的 {c_m['手续费合计'] / 10000:.0%}",
-        "与 Jaquart 等 (2021) 一致：扣费前赚、扣费后亏",
-        "Bysik 等 (2026) 称加了成本门槛就能赚，我们照这个思路做了，没能复现",
+        f"一年交易 {c_m['每年交易笔数']:.0f} 笔，平均只拿 {c_m['平均持仓天数']:.1f} 天；"
+        f"7.5 年手续费一共 {c_m['手续费合计']:,.0f} USDT，相当于本金的 {c_m['手续费合计'] / 10000:.0%}",
+        "和 Jaquart 等 (2021) 一样：扣费前赚，扣费后亏",
+        "Bysik 等 (2026) 说加了成本门槛就能赚，我们照着做了，没能复现",
     ], size=14, spacing=6)
-    rows = [["", "论文规则", "机器学习"],
+    rows = [["", "论文原版", "机器学习"],
             ["每年交易", f"{c_t['每年交易笔数']:.0f} 笔", f"{c_m['每年交易笔数']:.0f} 笔"],
             ["平均持仓", f"{c_t['平均持仓天数']:.0f} 天", f"{c_m['平均持仓天数']:.1f} 天"],
             ["胜率", pct(c_t["计成本胜率"], 0), pct(c_m["计成本胜率"], 0)],
@@ -274,83 +390,78 @@ def main():
     k.table(s, Inches(9.1), Inches(1.75), Inches(3.65), rows, col_widths=[1.55, 1.05, 1.05], size=13,
             row_height=0.56)
     k.text_box(s, Inches(9.1), Inches(5.85), Inches(3.65), Inches(0.8),
-               [("胜率高不等于赚钱：论文规则靠少数大赚，机器学习每笔赚得太少", {"color": k.MUTED})], size=12)
+               [("胜率高不代表赚钱：论文原版靠少数几笔大赚，机器学习每笔赚得太少", {"color": k.MUTED})], size=12)
     k.footer(s, page, SOURCE)
-    k.notes(s, f"机器学习的结果很有意思。虚线是不计成本的净值，赚了 {pct(g_full['总收益'], 0)}；"
-               f"实线是同样的买卖信号扣掉成本，亏了 {pct(-m_full['总收益'], 0)}。"
-               f"它每年交易 {c_m['每年交易笔数']:.0f} 笔，平均只持有 {c_m['平均持仓天数']:.1f} 天，"
-               f"成本每年吃掉约 {c_m['成本每年吃掉'] * 100:.0f} 个百分点；论文规则每年只交易 {c_t['每年交易笔数']:.0f} 笔，"
-               f"成本每年不到 1 个点。所以模型不是完全没用，胜率有 {pct(c_m['计成本胜率'], 0)}，但它每笔赚得太少，付不起成本。"
-               "这和 Jaquart 等人 2021 年的发现一样。Bysik 等人 2026 年说加成本门槛就能赚，我们照这个思路做了，没有复现出来。")
+    k.notes(s, f"机器学习的结果挺有意思。虚线是不算手续费的净值，赚了 {pct(g_full['总收益'], 0)}；"
+               f"实线是同样的买卖信号扣掉手续费，亏了 {pct(-m_full['总收益'], 0)}。"
+               f"它一年交易 {c_m['每年交易笔数']:.0f} 笔，平均只拿 {c_m['平均持仓天数']:.1f} 天，"
+               f"手续费一年就吃掉 {c_m['成本每年吃掉'] * 100:.0f} 个百分点；论文原版一年只交易 {c_t['每年交易笔数']:.0f} 笔，"
+               "手续费一年还不到 1 个点。所以模型不是完全没用，它是有一点预测能力的，只是每笔赚得太少，付不起手续费。")
 
-    # 11 稳健性
+    # 14 稳健性检验
     page += 1
     s = k.blank(prs)
-    k.title(s, "稳健性：主策略不怕手续费，检查工具也没发现问题", "补充检验")
+    k.title(s, "稳健性检验")
     rows = [["每边成本", "年化收益", "夏普", "最大回撤"]]
     for _, r in fee.iterrows():
         label = "0（不计成本）" if r["单边成本"] == 0 else pct(r["单边成本"], 2)
         rows.append([label, pct(r["年化收益"]), f"{r['夏普']:.2f}", pct(r["最大回撤"])])
-    k.table(s, k.MARGIN, Inches(1.75), Inches(6.0), rows, col_widths=[1.8, 1.4, 1.1, 1.4], size=15,
+    k.table(s, k.MARGIN, Inches(1.65), Inches(6.0), rows, col_widths=[1.8, 1.4, 1.1, 1.4], size=15,
             row_height=0.62)
-    k.text_box(s, k.MARGIN, Inches(5.0), Inches(6.0), Inches(0.9),
-               [("表中为主策略（论文规则）2019-05 至 2026-10 的结果", {"color": k.MUTED})], size=12)
-    k.text_box(s, Inches(7.0), Inches(1.75), Inches(5.75), Inches(4.9), [
-        f"**手续费**：每边成本从 0 提到 0.5%，年化从 {pct(fee.iloc[0]['年化收益'])} 降到 {pct(fee_hi['年化收益'])}，因为日线策略换手低",
-        f"**偷看未来**：lookahead-analysis 截掉后面的数据重跑，两个策略各 {int(look_t['total_signals'])} 笔交易的买卖点全部一致。"
-        "机器学习被工具标为有差异，逐行查过只是小数点后第 14 位的浮点误差，外加截断处最后一根 K\u00a0线没出预测",
-        "**预热长度**：recursive-analysis 用 460 和 999 根 K 线预热，指标完全一致",
-        "**训练不越界**：机器学习每次训练都丢掉窗口最后 24 根 K 线，因为它们的标签要用到窗口之后的价格",
-        f"**净值核对**：逐笔订单重算 vs Freqtrade 账户记录，{recon_text}",
-    ], size=15, spacing=10)
+    k.text_box(s, k.MARGIN, Inches(4.9), Inches(6.0), Inches(0.9),
+               [("表里是论文原版 2019-05 至 2026-10 的结果", {"color": k.MUTED})], size=12)
+    k.text_box(s, Inches(7.0), Inches(1.65), Inches(5.75), Inches(5.0), [
+        f"**手续费**：成本从 0 提到 0.5%，年化只从 {pct(fee.iloc[0]['年化收益'])} 降到 {pct(fee_hi['年化收益'])}",
+        "**偷看未来**：三个策略各抽查 20 笔交易，截断重跑，买卖点都一致",
+        "**机器学习的“有差异”**：逐行查过，只是浮点误差，加上截断处最后一根 K 线没出预测",
+        "**预热长度**：用 460 根和 999 根 K 线预热，结果完全一样",
+        "**训练不越界**：机器学习每次训练都会丢掉最后 24 根 K 线，因为它们的答案要用到之后的价格",
+        "**净值核对**：自己用逐笔订单重算的净值和 Freqtrade 的账户记录对得上",
+    ], size=14, spacing=10)
     k.footer(s, page, SOURCE)
-    k.notes(s, "补充几项稳健性检验。主策略的成本从 0 提到 0.5%，年化只少两三个百分点，结论不变。"
-               "Freqtrade 的两个检查工具都没有发现买卖点被未来数据影响。机器学习被工具标了有差异，"
-               "我们逐行查过：一是相似度指标在小数点后第 14 位的浮点误差，二是截断重跑时最后一根 K 线没有预测，"
-               "其余每一行的预测和信号都完全一样。机器学习训练时，"
-               "窗口最后 24 根 K 线的标签要用到之后的价格，FreqAI 会自动丢掉，我们在日志里确认过。"
-               "我们还用逐笔订单独立重算了净值，和 Freqtrade 自己的记录逐日对得上。")
+    k.notes(s, "再补充几项检查。论文原版的手续费从 0 提到 0.5%，年化只少两三个点，结论不变。"
+               "Freqtrade 自带的检查工具没有发现买卖点受未来数据影响。机器学习被工具标了有差异，"
+               "我们一行一行查过，一是小数点后第 14 位的浮点误差，二是截断重跑时最后一根 K 线没有预测，"
+               "其他每一行的预测和信号都完全一样。我们还自己用逐笔订单重算了净值，和 Freqtrade 的记录逐日对得上。")
 
-    # 12 结论
+    # 15 结论和下一步
     page += 1
     s = k.blank(prs)
-    k.title(s, "结论与下一步", "总结")
-    k.text_box(s, k.MARGIN, Inches(1.65), Inches(7.0), Inches(5.0), [
+    k.title(s, "结论和下一步")
+    k.text_box(s, k.MARGIN, Inches(1.6), Inches(7.0), Inches(5.2), [
         ("结论", {"bold": True, "color": k.ACCENT, "size": 19}),
-        f"1. 论文规则在 2019–2025 有效：同等风险下年化 {pct(t_in['年化收益'])} vs {pct(s_in['年化收益'])}，"
-        "回撤不到持有的 1/4",
-        f"2. 论文发表后：最大回撤依旧只有 {pct(-t_post['最大回撤'])}，但超额收益消失，和文献的“发表后衰减”一致",
-        f"3. 机器学习：扣费前年化 {pct(g_full['年化收益'])}，扣费后 {pct(m_full['年化收益'])}。"
-        "交易太频繁，成本吃掉了全部收益",
-        "4. 所有结果都扣了成本、做了未来数据检查、分了样本内外，代码可复现",
+        f"1. 论文原版在 2019 到 2025 年是有效的：仓位一样的情况下，年化 {pct(t_in['年化收益'])}，持有只有 {pct(s_in['年化收益'])}",
+        f"2. 论文发表后：最多只亏 {pct(-t_post['最大回撤'])}，还是很稳；但没比持有多赚",
+        f"3. 机器学习：不算手续费年化 {pct(g_full['年化收益'])}，算上手续费 {pct(m_full['年化收益'])}，交易太勤，钱都给了手续费",
+        tuned_conclusion,
     ], size=16, spacing=12)
-    k.panel(s, Inches(7.9), Inches(1.75), Inches(4.85), Inches(3.6), "下一步",
-            ["资金费过滤：溢价过高时降仓（BIS 2023）",
-             "机器学习：拉长预测周期、降低换手，再用新数据检验",
+    k.panel(s, Inches(7.9), Inches(1.7), Inches(4.85), Inches(3.6), "下一步",
+            ["资金费过滤：过热时降仓（BIS 2023）",
+             "机器学习：预测更长的周期，少交易",
              "用永续合约做空，熊市也能赚",
-             "扩到论文的 20 个币轮动",
-             "Freqtrade 模拟盘实时运行，与回测对比"], size=15)
+             "扩到论文里的 20 个币",
+             "在 Freqtrade 模拟盘上实时跑，和回测对比"], size=15)
     k.footer(s, page, SOURCE)
-    k.notes(s, "总结一下：论文规则在样本期内确实有效；发表之后风险控制还在，但超额收益没了。"
-               "机器学习有一点预测力，但交易太频繁，成本把收益吃光了。"
-               "下一步可以加资金费过滤、给机器学习降低换手、做空、扩到更多币种，并让它在模拟盘上实时跑起来。谢谢大家。")
+    k.notes(s, "总结一下。论文原版在它的样本期里确实有效；发表以后还是很稳，但没比持有多赚。"
+               "机器学习有一点预测能力，可是交易太勤，手续费把收益吃光了。" + tuned_conclusion_notes +
+               "下一步我们想加资金费过滤、让机器学习少交易、试试做空、扩到更多币，并且放到模拟盘上实时跑。谢谢大家。")
 
-    # 13 附录：特征重要性
+    # 16 附录：特征重要性
     page += 1
     s = k.blank(prs)
-    k.title(s, "附：机器学习最看重哪些特征", "附录")
-    k.image(s, RES / "ml_feature_importance.png", k.MARGIN, Inches(1.55), width=Inches(8.2))
+    k.title(s, "附录：机器学习看重哪些特征")
+    k.image(s, RES / "ml_feature_importance.png", k.MARGIN, Inches(1.5), width=Inches(8.2))
     k.panel(s, Inches(9.1), Inches(1.6), Inches(3.65), Inches(4.5), "看点",
-            ["最有用的是慢变量：离近 7 天、30 天高低点的距离和波动率，和论文规则用的是同一类信息",
-             "1–4 小时的涨跌幅、量比几乎没用，各约 0.5%",
-             "另一个币的特征占一半重要性：BTC 和 ETH 联动很强",
-             "**信息是慢的，交易却是快的** —— 这就是成本吃掉收益的原因"], size=14)
-    k.footer(s, page, "780 个滚动模型（390 周 × 2 个币）的平均特征重要性，按信息增益计")
-    k.notes(s, "这一页备用。780 个滚动训练的模型平均下来，最重要的特征是离近 7 天、30 天高低点的距离和波动率，"
+            ["最有用的是变化慢的：离最近 7 天、30 天高低点有多远，还有波动率，和论文规则用的是同一类信息",
+             "1 到 4 小时的涨跌幅、成交量几乎没用，各占 0.5% 左右",
+             "另一个币的特征占了一半：BTC 和 ETH 一起涨跌",
+             "**有用的信息变得慢，它却交易得快**，所以被手续费吃掉"], size=14)
+    k.footer(s, page, "780 个滚动训练的模型（390 周 × 2 个币）平均下来的特征重要性，按信息增益算")
+    k.notes(s, "这页备用。780 个模型平均下来，最重要的是离最近 7 天、30 天高低点有多远，还有波动率，"
                "和论文规则用的是同一类信息；1 到 4 小时的短期特征几乎没用。模型能用的信息变化很慢，"
-               "却按小时进出，这就是成本吃掉收益的原因。")
+               "它却按小时进进出出，这就是手续费吃掉收益的原因。")
 
-    out = RES / "展示.pptx"
+    out = RES / "展示_v2.pptx"
     prs.save(out)
     print("saved", out)
 

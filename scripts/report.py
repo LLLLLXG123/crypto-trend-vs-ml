@@ -37,10 +37,19 @@ COLORS = {
     "一直持有 ETH": "#a5a5a5",
     "BTC/ETH 各半持有": "#404040",
     "同等仓位持有": "#7fa7d0",
+    "调参版（TrendTuned）": "#2f7d4f",
+    "同等仓位持有（调参版）": "#93c4a6",
 }
+TUNED = "调参版（TrendTuned）"
+TUNED_SAME = "同等仓位持有（调参版）"
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
+
+
+def shown(name: str) -> str:
+    """图上显示的名字，和 PPT 的叫法一致。"""
+    return name.replace("论文规则", "论文原版")
 
 
 def load_closes() -> pd.DataFrame:
@@ -228,9 +237,21 @@ def main():
             e, _ = equity_from_orders(gross_stats[label], closes)
             gross[label] = e.loc[start:end] / e.loc[start] * INITIAL
 
+    # 调参版（参数只在论文样本期上调过）和它的同等仓位基准，只进指标表和自己的图
+    tuned, tuned_avg_exposure = {}, None
+    if (NAMED / "tuned_fee0.0015.zip").exists():
+        tuned_stats = load_result("tuned_fee0.0015")
+        e, h = equity_from_orders(tuned_stats, closes)
+        tuned_raw, held[TUNED] = e, h
+        tuned_avg_exposure = float((h.loc[start:end].sum(axis=1) / e.loc[start:end]).mean())
+        tuned[TUNED] = e.loc[start:end] / e.loc[start] * INITIAL
+        tuned[TUNED_SAME] = constant_mix(closes, start, tuned_avg_exposure)
+        recon["tuned"] = wallet_check("tuned_fee0.0015", e)
+        json.dump(recon, open(OUT / "recon.json", "w", encoding="utf-8"))
+
     # 分段指标
     rows = []
-    for name, eq in {**curves, **gross}.items():
+    for name, eq in {**curves, **gross, **tuned}.items():
         for label, a, b in (("全区间", None, None),
                             ("论文样本期内", None, PAPER_END - pd.Timedelta(days=1)),
                             ("论文发表后", PAPER_END, None)):
@@ -281,7 +302,7 @@ def main():
     for name, eq in curves.items():
         lw = 2.4 if "（" in name else 1.3
         ls = "--" if name == "同等仓位持有" else "-"
-        label = f"同等仓位持有（BTC/ETH 共 {trend_avg_exposure:.0%}，其余现金）" if name == "同等仓位持有" else name
+        label = f"同等仓位持有（BTC/ETH 共 {trend_avg_exposure:.0%}，其余现金）" if name == "同等仓位持有" else shown(name)
         ax.plot(eq.index, eq.values, label=label, color=COLORS[name], linewidth=lw, linestyle=ls)
     ax.set_yscale("log")
     ax.set_ylabel("净值（初始 10,000 USDT，对数坐标）")
@@ -297,7 +318,7 @@ def main():
     for name in [n for n in curves if n != "一直持有 ETH"]:
         dd = drawdown(curves[name])
         lw = 2.0 if "（" in name else 1.2
-        ax.plot(dd.index, dd.values * 100, label=name, color=COLORS[name], linewidth=lw)
+        ax.plot(dd.index, dd.values * 100, label=shown(name), color=COLORS[name], linewidth=lw)
     ax.set_ylabel("回撤（%）")
     style_axes(ax, "回撤：离前高跌了多少")
     mark_paper_end(ax, end, y=0.03)
@@ -314,7 +335,7 @@ def main():
     ax1.plot(closes.loc[start:end].index, closes.loc[start:end, "BTC/USDT"], color="#404040", linewidth=1.3)
     ax1.set_yscale("log")
     ax1.set_ylabel("BTC 价格（USDT）")
-    style_axes(ax1, "主策略什么时候在场：BTC 价格与 BTC 仓位")
+    style_axes(ax1, "论文原版什么时候在场：BTC 价格与 BTC 仓位")
     ax2.fill_between(btc_weight.index, btc_weight.values * 100, color="#1f4e79", alpha=0.55, linewidth=0)
     ax2.set_ylabel("BTC 仓位占总资产（%）")
     ax2.set_ylim(0, 55)
@@ -329,7 +350,7 @@ def main():
         post = eq.loc[PAPER_END:]
         post = post / post.iloc[0] * INITIAL
         lw = 2.6 if "（" in name else 1.3
-        ax.plot(post.index, post.values, label=name, color=COLORS[name], linewidth=lw)
+        ax.plot(post.index, post.values, label=shown(name), color=COLORS[name], linewidth=lw)
     ax.axhline(INITIAL, color="#999999", linewidth=0.8)
     ax.set_ylabel("净值（2025-03-15 = 10,000 USDT）")
     style_axes(ax, "论文发表之后：同一起点重新比较")
@@ -349,7 +370,7 @@ def main():
         ax.scatter(x, y, s=160, color=COLORS[name], zorder=3)
         if name in holds:
             continue
-        label = f"同等仓位持有（{trend_avg_exposure:.0%}）" if name == "同等仓位持有" else name
+        label = f"同等仓位持有（{trend_avg_exposure:.0%}）" if name == "同等仓位持有" else shown(name)
         ax.annotate(f"{label}\n夏普 {row['夏普']:.2f}", (x, y), textcoords="offset points",
                     xytext=(12, -6), fontsize=9.5, color="#222222")
     hold_rows = full.loc[holds]
@@ -395,15 +416,23 @@ def main():
         fig.savefig(OUT / "ml_costs.png")
         plt.close(fig)
 
-    # 平均仓位（持仓市值 / 总资产）
+    # 平均仓位（持仓市值 / 总资产），用没归一的原始净值
+    raw_equity = {"论文规则（TrendEnsemble）": trend_eq}
+    if ml_path.exists():
+        raw_equity["机器学习（MLXGBoost）"] = ml_eq
+    if tuned:
+        raw_equity[TUNED] = tuned_raw
     exposure_rows = []
     for name, h in held.items():
-        eq = (trend_eq if name.startswith("论文") else ml_eq).loc[start:end]
+        eq = raw_equity[name].loc[start:end]
         w = h.loc[start:end].sum(axis=1) / eq
         exposure_rows.append({"策略": name, "平均仓位": w.mean(), "最高仓位": w.max(),
                               "有持仓的天数占比": (w > 0.001).mean()})
     pd.DataFrame(exposure_rows).to_csv(OUT / "exposure.csv", index=False, encoding="utf-8-sig")
-    json.dump({"trend_avg_exposure": trend_avg_exposure}, open(OUT / "baseline.json", "w"))
+    json.dump({"trend_avg_exposure": trend_avg_exposure, "tuned_avg_exposure": tuned_avg_exposure},
+              open(OUT / "baseline.json", "w"))
+    if tuned:
+        plot_tuned(curves["论文规则（TrendEnsemble）"], tuned, start, end, tuned_avg_exposure)
 
     # 手续费敏感度
     fee_rows = []
@@ -484,6 +513,51 @@ def plot_feature_importance():
         ax.spines[side].set_visible(False)
     fig.tight_layout()
     fig.savefig(OUT / "ml_feature_importance.png")
+    plt.close(fig)
+
+
+def label_ends(fig, ax, ends, min_gap_pt=14):
+    """在每条线的终点标总收益；终点太近时把标签上下错开，免得叠在一起。"""
+    fig.canvas.draw()
+    to_px = ax.transData.transform
+    min_gap_px = min_gap_pt * fig.dpi / 72
+    ends = sorted(ends, key=lambda e: e[1])
+    placed = []
+    for x, y, color in ends:
+        py = to_px((mdates.date2num(x), y))[1]
+        target = max(py, placed[-1] + min_gap_px) if placed else py
+        placed.append(target)
+        ax.annotate(f"{y / INITIAL - 1:+.0%}", (x, y), textcoords="offset points",
+                    xytext=(5, (target - py) * 72 / fig.dpi - 4), fontsize=11, color=color, fontweight="bold")
+
+
+def plot_tuned(paper: pd.Series, tuned: dict, start: pd.Timestamp, end: pd.Timestamp, exposure: float):
+    """调参版 vs 论文原版：左边样本内（调参用的数据），右边样本外（从同一起点重新归一）。"""
+    lines = {TUNED: tuned[TUNED], "论文规则（TrendEnsemble）": paper, TUNED_SAME: tuned[TUNED_SAME]}
+    labels = {TUNED: "调参版", "论文规则（TrendEnsemble）": "论文原版",
+              TUNED_SAME: f"同等仓位持有（{exposure:.0%}，和调参版一样）"}
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.2), dpi=150, gridspec_kw={"width_ratios": [3, 2]})
+    spans = (("样本内：调参用的就是这段数据", start, PAPER_END - pd.Timedelta(days=1)),
+             ("样本外：调参时没见过的行情", PAPER_END, end))
+    for ax, (title, a, b) in zip(axes, spans):
+        ends = []
+        for name, eq in lines.items():
+            part = eq.loc[a:b]
+            part = part / part.iloc[0] * INITIAL
+            lw = 2.6 if name == TUNED else 1.6
+            ls = "--" if name == TUNED_SAME else "-"
+            ax.plot(part.index, part.values, color=COLORS[name], linewidth=lw, linestyle=ls, label=labels[name])
+            ends.append((part.index[-1], part.iloc[-1], COLORS[name]))
+        ax.axhline(INITIAL, color="#999999", linewidth=0.8)
+        style_axes(ax, title)
+        ax.set_xlim(right=b + (b - a) * 0.11)
+        label_ends(fig, ax, ends)
+    axes[1].xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 7)))
+    axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    axes[0].set_ylabel("净值（每段起点 = 10,000 USDT）")
+    axes[0].legend(loc="upper left", frameon=False, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(OUT / "tuned.png")
     plt.close(fig)
 
 

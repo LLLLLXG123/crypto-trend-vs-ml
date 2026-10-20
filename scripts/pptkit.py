@@ -107,7 +107,9 @@ def callout(slide, left, top, width, height, text, size=17):
              [(text, {"color": WHITE, "bold": True, "em": WHITE})], size=size, anchor=MSO_ANCHOR.MIDDLE)
 
 
-def table(slide, left, top, width, rows, col_widths=None, size=12, row_height=0.42, header_size=None):
+def table(slide, left, top, width, rows, col_widths=None, size=12, row_height=0.42, header_size=None,
+          left_cols=(0,)):
+    """left_cols：左对齐的列（默认只有第一列），其余居中。"""
     n_rows, n_cols = len(rows), len(rows[0])
     shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, Inches(row_height * n_rows))
     tbl = shape.table
@@ -126,7 +128,7 @@ def table(slide, left, top, width, rows, col_widths=None, size=12, row_height=0.
             tf = cell.text_frame
             tf.word_wrap = True
             p = tf.paragraphs[0]
-            p.alignment = PP_ALIGN.LEFT if c == 0 else PP_ALIGN.CENTER
+            p.alignment = PP_ALIGN.LEFT if c in left_cols else PP_ALIGN.CENTER
             text = str(value)
             bold = r == 0 or text.startswith("**")
             run = p.add_run()

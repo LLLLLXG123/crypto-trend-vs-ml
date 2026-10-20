@@ -1,0 +1,29 @@
+{
+  "strategy_name": "TrendTuned",
+  "params": {
+    "roi": {
+      "0": 100.0
+    },
+    "stoploss": {
+      "stoploss": -0.99
+    },
+    "trailing": {
+      "trailing_stop": false,
+      "trailing_stop_positive": null,
+      "trailing_stop_positive_offset": 0.0,
+      "trailing_only_offset_is_reached": false
+    },
+    "max_open_trades": {
+      "max_open_trades": 2
+    },
+    "buy": {
+      "drop_short": 2,
+      "lb_scale": 0.5,
+      "stop_frac": 0.7,
+      "vol_target": 0.55,
+      "vol_window": 90
+    }
+  },
+  "ft_stratparam_v": 1,
+  "export_time": "2026-10-20 04:21:11.316040+00:00"
+}
