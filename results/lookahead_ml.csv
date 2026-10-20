@@ -1,0 +1,2 @@
+filename,strategy,has_bias,total_signals,biased_entry_signals,biased_exit_signals,biased_indicators
+MLXGBoost.py,MLXGBoost,True,20,0,0,"&-s_close,&-s_close_mean,&-s_close_std,do_predict,DI_values,enter_tag,enter_long,exit_tag,exit_long"
